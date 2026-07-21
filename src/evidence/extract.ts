@@ -76,10 +76,10 @@ Rules:
     // Evidence check 2: numeric claims must appear in the quote itself
     // (normalized digits) — an answer of "70,000" citing an unrelated
     // line is downgraded, not confirmed.
-    if (supported && a.answer) {
+    if (supported && a.answer && entry) {
       const nums = String(a.answer).replace(/[,\s]/g, "").match(/\d{2,}/g);
       if (nums) {
-        const quoteDigits = entry!.text.replace(/[,\s]/g, "");
+        const quoteDigits = entry.text.replace(/[,\s]/g, "");
         supported = nums.every((n) => quoteDigits.includes(n));
       }
     }
@@ -87,8 +87,8 @@ Rules:
       question: q,
       answer: a.answer ?? null,
       status: a.status === "confirmed" && supported ? "confirmed" : a.answer ? "unconfirmed" : "unanswered",
-      quote: supported ? entry.text : null,
-      at: supported ? entry.at : null
+      quote: supported && entry ? entry.text : null,
+      at: supported && entry ? entry.at : null
     };
   });
 
