@@ -28,6 +28,11 @@ const app = Fastify({ logger: true });
 await app.register(websocket);
 await app.register(formbody);
 
+process.on("uncaughtException", (e) => app.log.error(e, "uncaughtException"));
+process.on("unhandledRejection", (e) => app.log.error(e as Error, "unhandledRejection"));
+
+app.get("/health", async () => ({ ok: true, tasks: tasks.size, uptime: process.uptime() }));
+
 // ---- Task API -------------------------------------------------------------
 
 app.post("/v1/tasks", async (req, reply) => {
