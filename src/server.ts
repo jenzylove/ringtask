@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import { BriefSchema, type Brief } from "./brief.js";
 import { placeCall, twimlForStream } from "./telephony/twilio.js";
 import { CallSession, type TranscriptEntry } from "./call/session.js";
+import { extractEvidence, type CallEvidence } from "./evidence/extract.js";
+import { renderResultPage } from "./resultPage.js";
 
 interface CallRecord {
   callSid?: string;
@@ -13,6 +15,7 @@ interface CallRecord {
   status: string;
   transcript: TranscriptEntry[];
   startedAt: string;
+  evidence?: CallEvidence;
 }
 
 interface Task {
@@ -73,6 +76,12 @@ app.get<{ Params: { id: string } }>("/v1/tasks/:id", async (req, reply) => {
   return task;
 });
 
+app.get<{ Params: { id: string } }>("/t/:id", async (req, reply) => {
+  const task = tasks.get(req.params.id);
+  if (!task) return reply.code(404).type("text/html").send("<h1>Task not found</h1>");
+  reply.type("text/html").send(renderResultPage(task.taskId, task.brief, task.status, task.calls));
+});
+
 // ---- Twilio webhooks ------------------------------------------------------
 
 app.all("/twiml", async (req, reply) => {
@@ -126,7 +135,12 @@ app.get("/media", { websocket: true }, (ws, req) => {
         if (task.calls.every((c) => c.transcript.length || ["failed", "no-answer", "busy", "completed"].includes(c.status))) {
           task.status = "completed";
         }
-        app.log.info(`[${taskId}] call finished, ${transcript.length} transcript entries`);
+        dbg(`[${taskId}] call finished, ${transcript.length} transcript entries`);
+        if (rec) {
+          extractEvidence(task.brief, transcript)
+            .then((ev) => { rec.evidence = ev; dbg(`[${taskId}] evidence extracted: ${ev.outcome}`); })
+            .catch((e) => dbg(`[${taskId}] extraction error: ${e.message}`));
+        }
       }
     );
     session.handleMessage(raw.toString()); // replay the start frame we consumed

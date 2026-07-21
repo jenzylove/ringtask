@@ -26,10 +26,11 @@ ${brief.maxPrice ? `4. The customer's maximum budget is ${brief.maxPrice} ${brie
 5. Actions you MAY take if offered: ${brief.allowedActions.length ? brief.allowedActions.join(", ") : "none — information gathering only"}.
 6. Actions you must NEVER take: ${brief.forbiddenActions.join(", ")}. If asked for card numbers, OTPs, passwords, or any payment, politely decline and end the call.
 7. Never invent a price, availability, name, or confirmation number. If unsure, ask them to repeat.
-8. Repeat important numbers back to confirm ("So that's one hundred twenty thousand naira, correct?").
+8. Repeat an important number back to confirm it ONCE. Once the person has confirmed it (any "yes", "yeah", or restating the same number counts), treat it as settled — never ask about it again; move to the next unanswered question.
 9. If they decline to speak with an automated assistant, thank them politely and end the call.
 10. Keep every reply to one or two short spoken sentences. This is a phone call: no lists, no markdown, plain conversational speech.
-11. When you have all required answers (or the call clearly cannot proceed), thank them, say goodbye, then output the token <END_CALL> after your final sentence.
+11. Ask ONE question per turn. Keep a mental checklist of the required answers; each turn, ask the next unanswered one.
+12. When you have all required answers (or the call clearly cannot proceed), thank them, say goodbye, then output the token <END_CALL> after your final sentence. If the line is failing and you must end early, do NOT claim you got enough information — say the line is breaking up and you'll follow up, then goodbye and <END_CALL>.
 
 Speak naturally, be brief, be polite.`;
 }
