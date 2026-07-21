@@ -28,10 +28,18 @@ const app = Fastify({ logger: true });
 await app.register(websocket);
 await app.register(formbody);
 
-process.on("uncaughtException", (e) => app.log.error(e, "uncaughtException"));
-process.on("unhandledRejection", (e) => app.log.error(e as Error, "unhandledRejection"));
+const debugRing: string[] = [];
+export function dbg(msg: string): void {
+  debugRing.push(`${new Date().toISOString()} ${msg}`);
+  if (debugRing.length > 200) debugRing.shift();
+  app.log.info(msg);
+}
+
+process.on("uncaughtException", (e) => dbg(`uncaughtException: ${e.message}`));
+process.on("unhandledRejection", (e) => dbg(`unhandledRejection: ${(e as Error)?.message ?? e}`));
 
 app.get("/health", async () => ({ ok: true, tasks: tasks.size, uptime: process.uptime() }));
+app.get("/debug", async () => ({ uptime: process.uptime(), events: debugRing }));
 
 // ---- Task API -------------------------------------------------------------
 
@@ -69,6 +77,7 @@ app.get<{ Params: { id: string } }>("/v1/tasks/:id", async (req, reply) => {
 
 app.all("/twiml", async (req, reply) => {
   const taskId = (req.query as any).taskId ?? "";
+  dbg(`twiml served for ${taskId}`);
   reply.type("text/xml").send(twimlForStream(taskId));
 });
 
@@ -83,16 +92,21 @@ app.post("/call-status", async (req) => {
 
 // ---- Media stream ---------------------------------------------------------
 
-app.get("/media", { websocket: true }, (ws) => {
+app.get("/media", { websocket: true }, (ws, req) => {
+  dbg(`media WS connected from ${req.headers["x-forwarded-for"] ?? req.ip} ua=${req.headers["user-agent"] ?? "?"}`);
   let session: CallSession | null = null;
+  ws.on("close", (code: number) => dbg(`media WS closed code=${code} session=${!!session}`));
+  ws.on("error", (e: Error) => dbg(`media WS error: ${e.message}`));
 
   const onFirst = (raw: Buffer) => {
     let msg: any;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      dbg("media WS: unparseable first frame");
       return;
     }
+    dbg(`media WS frame event=${msg.event}`);
     if (msg.event !== "start") return; // ignore "connected" preamble
     ws.off("message", onFirst);
     const taskId = msg.start.customParameters?.taskId ?? "";
