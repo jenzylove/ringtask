@@ -8,6 +8,7 @@ import { placeCall, twimlForStream } from "./telephony/twilio.js";
 import { CallSession, type TranscriptEntry } from "./call/session.js";
 import { extractEvidence, type CallEvidence } from "./evidence/extract.js";
 import { renderResultPage } from "./resultPage.js";
+import { renderLandingPage } from "./landingPage.js";
 
 interface CallRecord {
   callSid?: string;
@@ -16,6 +17,7 @@ interface CallRecord {
   transcript: TranscriptEntry[];
   startedAt: string;
   evidence?: CallEvidence;
+  retried?: boolean;
 }
 
 interface Task {
@@ -44,6 +46,18 @@ process.on("unhandledRejection", (e) => dbg(`unhandledRejection: ${(e as Error)?
 app.get("/health", async () => ({ ok: true, tasks: tasks.size, uptime: process.uptime() }));
 app.get("/debug", async () => ({ uptime: process.uptime(), events: debugRing }));
 
+// API-key gate on mutating routes. Twilio webhooks (/twiml, /call-status,
+// /media) and read-only result pages stay open by design.
+app.addHook("onRequest", async (req, reply) => {
+  const mutating = req.method === "POST" && req.url.startsWith("/v1/");
+  if (!mutating) return;
+  const key = process.env.RINGTASK_API_KEY;
+  if (!key) return; // no key configured (local dev) — open
+  if (req.headers["x-api-key"] !== key) {
+    return reply.code(401).send({ error: "invalid or missing x-api-key" });
+  }
+});
+
 // ---- Task API -------------------------------------------------------------
 
 app.post("/v1/tasks", async (req, reply) => {
@@ -59,8 +73,9 @@ app.post<{ Params: { id: string }; Body: { to: string } }>("/v1/tasks/:id/call",
   if (!task) return reply.code(404).send({ error: "task not found" });
   const to = (req.body as any)?.to;
   if (!/^\+\d{7,15}$/.test(to ?? "")) return reply.code(400).send({ error: "to must be E.164, e.g. +2348012345678" });
-  if (task.calls.length >= task.brief.maxBusinesses) {
-    return reply.code(400).send({ error: `task limited to ${task.brief.maxBusinesses} calls` });
+  const uniqueNumbers = new Set(task.calls.map((c) => c.to));
+  if (!uniqueNumbers.has(to) && uniqueNumbers.size >= task.brief.maxBusinesses) {
+    return reply.code(400).send({ error: `task limited to ${task.brief.maxBusinesses} businesses` });
   }
   const record: CallRecord = { to, status: "initiated", transcript: [], startedAt: new Date().toISOString() };
   task.calls.push(record);
@@ -74,6 +89,10 @@ app.get<{ Params: { id: string } }>("/v1/tasks/:id", async (req, reply) => {
   const task = tasks.get(req.params.id);
   if (!task) return reply.code(404).send({ error: "task not found" });
   return task;
+});
+
+app.get("/", async (_req, reply) => {
+  reply.type("text/html").send(renderLandingPage());
 });
 
 app.get<{ Params: { id: string } }>("/t/:id", async (req, reply) => {
@@ -90,12 +109,31 @@ app.all("/twiml", async (req, reply) => {
   reply.type("text/xml").send(twimlForStream(taskId));
 });
 
+const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS ?? 120_000);
+
 app.post("/call-status", async (req) => {
   const body = req.body as any;
   const task = tasks.get((req.query as any).taskId ?? "");
   const rec = task?.calls.find((c) => c.callSid === body.CallSid);
   if (rec) rec.status = body.CallStatus;
-  app.log.info({ callSid: body.CallSid, status: body.CallStatus }, "call status");
+  dbg(`call status ${body.CallSid} -> ${body.CallStatus}`);
+
+  // Retry policy: one automatic redial per number on no-answer/busy.
+  if (task && rec && ["no-answer", "busy"].includes(body.CallStatus) && !rec.retried) {
+    rec.retried = true;
+    dbg(`[${task.taskId}] scheduling retry of ${rec.to} in ${RETRY_DELAY_MS / 1000}s`);
+    setTimeout(async () => {
+      try {
+        const retry: CallRecord = { to: rec.to, status: "initiated", transcript: [], startedAt: new Date().toISOString(), retried: true };
+        task.calls.push(retry);
+        const { callSid } = await placeCall(rec.to, task.taskId);
+        retry.callSid = callSid;
+        dbg(`[${task.taskId}] retry placed ${callSid}`);
+      } catch (e: any) {
+        dbg(`[${task.taskId}] retry failed: ${e.message}`);
+      }
+    }, RETRY_DELAY_MS);
+  }
   return "ok";
 });
 
