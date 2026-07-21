@@ -71,8 +71,18 @@ Rules:
     const a = parsed.answers?.[i] ?? {};
     const idx = typeof a.quoteIndex === "number" ? a.quoteIndex : null;
     const entry = idx !== null && transcript[idx] ? transcript[idx] : null;
-    // Evidence check: the cited line must be a real caller turn.
-    const supported = entry !== null && entry.role === "caller";
+    // Evidence check 1: the cited line must be a real caller turn.
+    let supported = entry !== null && entry.role === "caller";
+    // Evidence check 2: numeric claims must appear in the quote itself
+    // (normalized digits) — an answer of "70,000" citing an unrelated
+    // line is downgraded, not confirmed.
+    if (supported && a.answer) {
+      const nums = String(a.answer).replace(/[,\s]/g, "").match(/\d{2,}/g);
+      if (nums) {
+        const quoteDigits = entry!.text.replace(/[,\s]/g, "");
+        supported = nums.every((n) => quoteDigits.includes(n));
+      }
+    }
     return {
       question: q,
       answer: a.answer ?? null,

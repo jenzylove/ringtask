@@ -1,17 +1,30 @@
 import { z } from "zod";
 
+/** Server policy: always enforced, cannot be removed or overridden by the task author. */
+export const MANDATORY_FORBIDDEN = [
+  "make payment", "share card details", "share personal identifiers",
+  "request passwords, PINs, OTPs or recovery codes", "claim to be human", "impersonate a specific person"
+] as const;
+
+/** Reviewed set of actions a task may permit — free-text actions are rejected. */
+export const ALLOWED_ACTION_ENUM = ["hold appointment", "hold item", "open support case"] as const;
+
 export const BriefSchema = z.object({
-  goal: z.string().min(4),
-  location: z.string(),
+  goal: z.string().min(4).max(300),
+  location: z.string().min(2).max(120),
   maxPrice: z.number().positive().optional(),
-  currency: z.string().default("NGN"),
-  requiredAnswers: z.array(z.string()).min(1),
-  allowedActions: z.array(z.string()).default([]),
-  forbiddenActions: z.array(z.string()).default(["make payment", "share card details", "share personal identifiers"]),
-  businessName: z.string().optional(),
-  userDisplayName: z.string().default("a RingTask customer"),
+  currency: z.string().max(8).default("NGN"),
+  requiredAnswers: z.array(z.string().max(100)).min(1).max(8),
+  allowedActions: z.array(z.enum(ALLOWED_ACTION_ENUM)).max(3).default([]),
+  forbiddenActions: z.array(z.string().max(100)).max(10).default([]),
+  businessName: z.string().max(120).optional(),
+  userDisplayName: z.string().max(80).default("a RingTask customer"),
   maxBusinesses: z.number().int().min(1).max(3).default(3)
-});
+}).transform((b) => ({
+  ...b,
+  // User-supplied prohibitions extend, never replace, server policy.
+  forbiddenActions: [...MANDATORY_FORBIDDEN, ...b.forbiddenActions.filter((f) => !(MANDATORY_FORBIDDEN as readonly string[]).includes(f))]
+}));
 
 export type Brief = z.infer<typeof BriefSchema>;
 

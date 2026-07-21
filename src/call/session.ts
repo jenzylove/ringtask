@@ -30,11 +30,13 @@ export class CallSession {
   private stt: DeepgramStt;
   private history: ChatMessage[];
   private pendingUtterance: string[] = [];
+  private queuedTurn: string | null = null; // caller turn finalized while a response was in flight
   private speaking = false; // agent audio currently being sent
   private thinking = false; // LLM/TTS turn in flight
   private ttsAbort: AbortController | null = null;
   private closed = false;
   private endRequested = false;
+  private deadline?: NodeJS.Timeout;
 
   constructor(
     private twilioWs: WebSocket,
@@ -50,11 +52,21 @@ export class CallSession {
         this.pendingUtterance.push(text);
       },
       onUtteranceEnd: () => void this.commitCallerTurn(),
-      onError: (e) => this.log(`deepgram error: ${e.message}`)
+      onError: (e) => {
+        this.log(`deepgram error: ${e.message} — ending call`);
+        this.hangup();
+      }
     });
 
     twilioWs.on("message", (raw) => this.handleMessage(raw.toString()));
     twilioWs.on("close", () => this.finish());
+
+    // Hard whole-call deadline: never leave a connected call open past this.
+    const maxMs = Number(process.env.MAX_CALL_MS ?? 300_000);
+    this.deadline = setTimeout(() => {
+      this.log(`max call duration ${maxMs}ms reached — hanging up`);
+      this.hangup();
+    }, maxMs);
   }
 
   /** Public so the server can replay the buffered "start" frame it consumed to route the connection. */
@@ -87,12 +99,21 @@ export class CallSession {
     }
   }
 
-  /** Caller finished talking — commit their utterance and answer it. */
+  /**
+   * Caller finished talking — commit their utterance and answer it.
+   * If a response is already in flight, the utterance is queued (never
+   * discarded) and drained when the in-flight turn settles.
+   */
   private async commitCallerTurn(): Promise<void> {
     const text = this.pendingUtterance.join(" ").trim();
     this.pendingUtterance = [];
-    if (!text || this.thinking) return;
+    if (!text) return;
     this.transcript.push({ role: "caller", text, at: new Date().toISOString() });
+    if (this.thinking) {
+      this.queuedTurn = this.queuedTurn ? `${this.queuedTurn} ${text}` : text;
+      this.ttsAbort?.abort(); // cancel the stale in-flight response
+      return;
+    }
     this.history.push({ role: "user", content: text });
     await this.respond();
   }
@@ -127,16 +148,27 @@ export class CallSession {
     } finally {
       this.thinking = false;
       this.ttsAbort = null;
+      // Drain any caller turn that arrived while we were responding.
+      if (this.queuedTurn && !this.closed) {
+        const queued = this.queuedTurn;
+        this.queuedTurn = null;
+        this.history.push({ role: "user", content: queued });
+        void this.respond();
+      }
     }
   }
 
-  /** Caller started speaking while agent audio is queued — stop talking. */
+  /** Caller started speaking while the agent is talking or thinking — yield. */
   private bargeIn(): void {
-    if (!this.speaking) return;
-    this.speaking = false;
-    this.ttsAbort?.abort();
-    this.sendTwilio({ event: "clear", streamSid: this.streamSid });
-    this.log("barge-in: cleared agent audio");
+    if (this.speaking) {
+      this.speaking = false;
+      this.ttsAbort?.abort();
+      this.sendTwilio({ event: "clear", streamSid: this.streamSid });
+      this.log("barge-in: cleared agent audio");
+    } else if (this.thinking) {
+      this.ttsAbort?.abort();
+      this.log("barge-in: cancelled in-flight response");
+    }
   }
 
   private hangup(): void {
@@ -153,6 +185,7 @@ export class CallSession {
   private finish(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.deadline) clearTimeout(this.deadline);
     this.stt.close();
     this.ttsAbort?.abort();
     this.onDone(this.transcript);

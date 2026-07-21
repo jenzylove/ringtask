@@ -1,5 +1,6 @@
 import "dotenv/config";
 import Fastify from "fastify";
+import twilio from "twilio";
 import websocket from "@fastify/websocket";
 import formbody from "@fastify/formbody";
 import { randomUUID } from "node:crypto";
@@ -40,17 +41,17 @@ export function dbg(msg: string): void {
   app.log.info(msg);
 }
 
-process.on("uncaughtException", (e) => dbg(`uncaughtException: ${e.message}`));
-process.on("unhandledRejection", (e) => dbg(`unhandledRejection: ${(e as Error)?.message ?? e}`));
+process.on("uncaughtException", (e) => { dbg(`uncaughtException: ${e.message}`); process.exit(1); });
+process.on("unhandledRejection", (e) => { dbg(`unhandledRejection: ${(e as Error)?.message ?? e}`); process.exit(1); });
 
 app.get("/health", async () => ({ ok: true, tasks: tasks.size, uptime: process.uptime() }));
-app.get("/debug", async () => ({ uptime: process.uptime(), events: debugRing }));
 
-// API-key gate on mutating routes. Twilio webhooks (/twiml, /call-status,
-// /media) and read-only result pages stay open by design.
+// API-key gate: the whole /v1 API (reads included — transcripts are private)
+// plus /debug. Twilio webhooks are signature-validated instead; the /t page
+// is shareable but redacted.
 app.addHook("onRequest", async (req, reply) => {
-  const mutating = req.method === "POST" && req.url.startsWith("/v1/");
-  if (!mutating) return;
+  const gated = req.url.startsWith("/v1/") || req.url.startsWith("/debug");
+  if (!gated) return;
   const key = process.env.RINGTASK_API_KEY;
   if (!key) return; // no key configured (local dev) — open
   if (req.headers["x-api-key"] !== key) {
@@ -58,12 +59,24 @@ app.addHook("onRequest", async (req, reply) => {
   }
 });
 
+app.get("/debug", async () => ({ uptime: process.uptime(), events: debugRing }));
+
+/** Validate X-Twilio-Signature on webhook callbacks (skipped in local dev without a token). */
+function isFromTwilio(req: { headers: Record<string, unknown>; body?: unknown; url: string }): boolean {
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!token || !process.env.PUBLIC_HOST) return true;
+  const sig = req.headers["x-twilio-signature"];
+  if (typeof sig !== "string") return false;
+  const url = `https://${process.env.PUBLIC_HOST}${req.url}`;
+  return twilio.validateRequest(token, sig, url, (req.body as Record<string, string>) ?? {});
+}
+
 // ---- Task API -------------------------------------------------------------
 
 app.post("/v1/tasks", async (req, reply) => {
   const parsed = BriefSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-  const task: Task = { taskId: `task_${randomUUID().slice(0, 8)}`, brief: parsed.data, status: "created", calls: [] };
+  const task: Task = { taskId: `task_${randomUUID()}`, brief: parsed.data, status: "created", calls: [] };
   tasks.set(task.taskId, task);
   return { taskId: task.taskId, status: task.status, normalizedBrief: task.brief };
 });
@@ -98,12 +111,15 @@ app.get("/", async (_req, reply) => {
 app.get<{ Params: { id: string } }>("/t/:id", async (req, reply) => {
   const task = tasks.get(req.params.id);
   if (!task) return reply.code(404).type("text/html").send("<h1>Task not found</h1>");
-  reply.type("text/html").send(renderResultPage(task.taskId, task.brief, task.status, task.calls));
+  // Shareable page: redact destination numbers to last 4 digits.
+  const redacted = task.calls.map((c) => ({ ...c, to: `•••${c.to.slice(-4)}` }));
+  reply.type("text/html").send(renderResultPage(task.taskId, task.brief, task.status, redacted));
 });
 
 // ---- Twilio webhooks ------------------------------------------------------
 
 app.all("/twiml", async (req, reply) => {
+  if (!isFromTwilio(req as any)) return reply.code(403).send("forbidden");
   const taskId = (req.query as any).taskId ?? "";
   dbg(`twiml served for ${taskId}`);
   reply.type("text/xml").send(twimlForStream(taskId));
@@ -111,7 +127,8 @@ app.all("/twiml", async (req, reply) => {
 
 const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS ?? 120_000);
 
-app.post("/call-status", async (req) => {
+app.post("/call-status", async (req, reply) => {
+  if (!isFromTwilio(req as any)) return reply.code(403).send("forbidden");
   const body = req.body as any;
   const task = tasks.get((req.query as any).taskId ?? "");
   const rec = task?.calls.find((c) => c.callSid === body.CallSid);
@@ -163,7 +180,12 @@ app.get("/media", { websocket: true }, (ws, req) => {
       ws.close();
       return;
     }
-    const rec = task.calls.find((c) => c.callSid === msg.start.callSid) ?? task.calls[task.calls.length - 1];
+    const rec = task.calls.find((c) => c.callSid === msg.start.callSid);
+    if (!rec) {
+      dbg(`media stream callSid ${msg.start.callSid} does not match any call on ${taskId} — rejecting`);
+      ws.close();
+      return;
+    }
     session = new CallSession(
       ws,
       task.brief,
