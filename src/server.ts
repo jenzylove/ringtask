@@ -5,7 +5,40 @@ import websocket from "@fastify/websocket";
 import formbody from "@fastify/formbody";
 import { randomUUID } from "node:crypto";
 import { BriefSchema, type Brief } from "./brief.js";
-import { paymentChallenge, verifyPaymentHeader, paymentReceipt, type VerifiedPayment } from "./x402.js";
+import { paymentChallenge, verifyPaymentHeader, paymentReceipt, type VerifiedPayment, type ServiceOffer } from "./x402.js";
+
+const BRIEF_BODY_SCHEMA = {
+  type: "object",
+  properties: {
+    goal: { type: "string", description: "What to find out or arrange" },
+    location: { type: "string" },
+    maxPrice: { type: "number" },
+    requiredAnswers: { type: "array", items: { type: "string" } },
+    numbers: { type: "array", items: { type: "string" }, description: "Business phone numbers (E.164, max 3) — calls are placed in this same request" }
+  },
+  required: []
+};
+
+const OFFERS: Record<string, ServiceOffer> = {
+  "/v1/tasks": {
+    amountBaseUnits: "1500000", // 1.5 USDT
+    description: "RingTask Phone Scout — calls up to 3 businesses, returns confirmed answers with transcript evidence. Returns taskId + evidence-page URL.",
+    bodySchema: BRIEF_BODY_SCHEMA
+  },
+  "/v1/services/appointment-hold": {
+    amountBaseUnits: "500000", // 0.5 USDT
+    description: "RingTask Appointment Availability & Hold — calls one chosen business and secures a temporary appointment slot. Returns taskId + evidence-page URL.",
+    bodySchema: {
+      type: "object",
+      properties: {
+        goal: { type: "string", description: "What appointment to hold" },
+        location: { type: "string" },
+        number: { type: "string", description: "Business phone number (E.164) — the call is placed in this same request" }
+      },
+      required: []
+    }
+  }
+};
 import { placeCall, twimlForStream } from "./telephony/twilio.js";
 import { CallSession, type TranscriptEntry } from "./call/session.js";
 import { extractEvidence, type CallEvidence } from "./evidence/extract.js";
@@ -53,12 +86,13 @@ app.get("/health", async () => ({ ok: true, tasks: tasks.size, uptime: process.u
 app.addHook("onRequest", async (req, reply) => {
   const path = req.url.split("?")[0];
   const key = process.env.RINGTASK_API_KEY;
-  // A2MCP entry: /v1/tasks is x402-gated — api key OR payment header unlocks;
+  // A2MCP entries are x402-gated — api key OR payment header unlocks;
   // anything else gets the 402 challenge (both v2 header and v1 body forms).
-  if (path === "/v1/tasks") {
+  const offer = OFFERS[path];
+  if (offer) {
     if (key && req.headers["x-api-key"] === key) return;
     if (req.method === "POST" && (req.headers["payment-signature"] || req.headers["x-payment"])) return;
-    const challenge = paymentChallenge(`https://${process.env.PUBLIC_HOST}/v1/tasks`);
+    const challenge = paymentChallenge(`https://${process.env.PUBLIC_HOST}${path}`, offer);
     return reply.code(402).header("PAYMENT-REQUIRED", challenge.header).send(challenge.body);
   }
   const gated = req.url.startsWith("/v1/") || req.url.startsWith("/debug");
@@ -99,38 +133,88 @@ function makeTask(brief: Brief): Task {
   return task;
 }
 
-app.post("/v1/tasks", async (req, reply) => {
-  // Paid x402 request or x-api-key both unlock task creation.
+/** Verify a payment header for the offer at `path`. Sends the 402 itself on rejection. */
+function checkPayment(req: any, reply: any, path: string): VerifiedPayment | null | "rejected" {
   const payHeader = (req.headers["payment-signature"] ?? req.headers["x-payment"]) as string | undefined;
-  let payment: VerifiedPayment | null = null;
-  if (payHeader) {
-    const v = verifyPaymentHeader(payHeader);
-    if (typeof v === "string") {
-      dbg(`x402 payment rejected: ${v}`);
-      return reply.code(402).send({ error: `payment invalid: ${v}` });
-    }
-    payment = v;
-    dbg(`x402 payment accepted from ${payment.payer} (${payment.scheme})`);
+  if (!payHeader) return null;
+  const v = verifyPaymentHeader(payHeader, OFFERS[path].amountBaseUnits);
+  if (typeof v === "string") {
+    dbg(`x402 payment rejected: ${v}`);
+    reply.code(402).send({ error: `payment invalid: ${v}` });
+    return "rejected";
   }
-  const parsed = BriefSchema.safeParse(req.body);
-  if (!parsed.success) {
-    // Paid request with an empty/invalid brief still gets a deliverable: a
-    // demo task (task creation alone never places calls).
-    if (payment) {
-      const task = makeTask(BriefSchema.parse(DEMO_BRIEF));
-      reply.header("PAYMENT-RESPONSE", paymentReceipt(payment));
-      return {
-        taskId: task.taskId, status: task.status,
-        note: "brief missing/invalid — demo task created; normalizedBrief shows the expected shape",
-        normalizedBrief: task.brief,
-        resultUrl: `https://${process.env.PUBLIC_HOST}/t/${task.taskId}`
-      };
+  dbg(`x402 payment accepted from ${v.payer} (${v.scheme}, ${v.verification})`);
+  return v;
+}
+
+/** Place calls for a task; returns per-number outcomes. Never throws. */
+async function dialNumbers(task: Task, numbers: string[]): Promise<Array<{ to: string; status: string }>> {
+  const out: Array<{ to: string; status: string }> = [];
+  for (const to of numbers.slice(0, task.brief.maxBusinesses)) {
+    if (!/^\+\d{7,15}$/.test(to)) { out.push({ to, status: "invalid: must be E.164" }); continue; }
+    const record: CallRecord = { to, status: "initiated", transcript: [], startedAt: new Date().toISOString() };
+    task.calls.push(record);
+    task.status = "calling";
+    try {
+      const { callSid } = await placeCall(to, task.taskId);
+      record.callSid = callSid;
+      out.push({ to, status: `calling (${callSid})` });
+    } catch (e: any) {
+      record.status = "failed";
+      out.push({ to, status: `failed: ${e.message}` });
+      dbg(`[${task.taskId}] dial ${to} failed: ${e.message}`);
     }
+  }
+  return out;
+}
+
+/** Shared handler: one paid request completes the advertised outcome (task + calls). */
+async function paidTaskEndpoint(req: any, reply: any, path: string, briefBody: unknown, numbers: string[]) {
+  const payment = checkPayment(req, reply, path);
+  if (payment === "rejected") return reply;
+  const parsed = BriefSchema.safeParse(briefBody);
+  let task: Task;
+  let note: string | undefined;
+  if (parsed.success) {
+    task = makeTask(parsed.data);
+  } else if (payment) {
+    // Paid request always gets a deliverable: a demo task if the brief is unusable.
+    task = makeTask(BriefSchema.parse(DEMO_BRIEF));
+    note = "brief missing/invalid — demo task created; normalizedBrief shows the expected shape";
+  } else {
     return reply.code(400).send({ error: parsed.error.flatten() });
   }
-  const task = makeTask(parsed.data);
+  const calls = numbers.length ? await dialNumbers(task, numbers) : [];
   if (payment) reply.header("PAYMENT-RESPONSE", paymentReceipt(payment));
-  return { taskId: task.taskId, status: task.status, normalizedBrief: task.brief, resultUrl: `https://${process.env.PUBLIC_HOST}/t/${task.taskId}` };
+  return {
+    taskId: task.taskId,
+    status: task.status,
+    ...(note ? { note } : {}),
+    normalizedBrief: task.brief,
+    calls,
+    ...(numbers.length === 0 ? { callNote: "no phone numbers supplied — add \"numbers\": [\"+234...\"] to place calls in the same request, or POST /v1/tasks/:id/call" } : {}),
+    resultUrl: `https://${process.env.PUBLIC_HOST}/t/${task.taskId}`
+  };
+}
+
+app.post("/v1/tasks", async (req, reply) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const { numbers, ...brief } = body;
+  return paidTaskEndpoint(req, reply, "/v1/tasks", brief, Array.isArray(numbers) ? (numbers as string[]) : []);
+});
+
+// Service 2: one call, one held slot.
+app.get("/v1/services/appointment-hold", async () => ({ ok: true }));
+app.post("/v1/services/appointment-hold", async (req, reply) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const brief = {
+    goal: typeof body.goal === "string" && body.goal.length >= 4 ? body.goal : "Check appointment availability and hold a slot (demo task)",
+    location: typeof body.location === "string" && body.location.length >= 2 ? body.location : "Lagos",
+    requiredAnswers: ["appointment availability", "earliest slot", "hold confirmation"],
+    allowedActions: ["hold appointment"],
+    maxBusinesses: 1
+  };
+  return paidTaskEndpoint(req, reply, "/v1/services/appointment-hold", brief, typeof body.number === "string" ? [body.number] : []);
 });
 
 app.post<{ Params: { id: string }; Body: { to: string } }>("/v1/tasks/:id/call", async (req, reply) => {
