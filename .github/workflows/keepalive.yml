@@ -1,0 +1,17 @@
+name: keepalive
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint (prevents Render free-tier sleep)
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://ringtask.onrender.com/health) && \
+            echo "attempt $i: HTTP $code" && [ "$code" = "200" ] && exit 0
+            sleep 20
+          done
+          echo "health check failed after 3 attempts" && exit 1

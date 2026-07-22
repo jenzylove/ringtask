@@ -5,6 +5,7 @@ import websocket from "@fastify/websocket";
 import formbody from "@fastify/formbody";
 import { randomUUID } from "node:crypto";
 import { BriefSchema, type Brief } from "./brief.js";
+import { paymentChallenge, verifyPaymentHeader, paymentReceipt, type VerifiedPayment } from "./x402.js";
 import { placeCall, twimlForStream } from "./telephony/twilio.js";
 import { CallSession, type TranscriptEntry } from "./call/session.js";
 import { extractEvidence, type CallEvidence } from "./evidence/extract.js";
@@ -50,14 +51,26 @@ app.get("/health", async () => ({ ok: true, tasks: tasks.size, uptime: process.u
 // plus /debug. Twilio webhooks are signature-validated instead; the /t page
 // is shareable but redacted.
 app.addHook("onRequest", async (req, reply) => {
+  const path = req.url.split("?")[0];
+  const key = process.env.RINGTASK_API_KEY;
+  // A2MCP entry: /v1/tasks is x402-gated — api key OR payment header unlocks;
+  // anything else gets the 402 challenge (both v2 header and v1 body forms).
+  if (path === "/v1/tasks") {
+    if (key && req.headers["x-api-key"] === key) return;
+    if (req.method === "POST" && (req.headers["payment-signature"] || req.headers["x-payment"])) return;
+    const challenge = paymentChallenge(`https://${process.env.PUBLIC_HOST}/v1/tasks`);
+    return reply.code(402).header("PAYMENT-REQUIRED", challenge.header).send(challenge.body);
+  }
   const gated = req.url.startsWith("/v1/") || req.url.startsWith("/debug");
   if (!gated) return;
-  const key = process.env.RINGTASK_API_KEY;
   if (!key) return; // no key configured (local dev) — open
   if (req.headers["x-api-key"] !== key) {
     return reply.code(401).send({ error: "invalid or missing x-api-key" });
   }
 });
+
+// Explicit GET so unauthenticated probes reach the 402 hook, not a 404.
+app.get("/v1/tasks", async () => ({ ok: true }));
 
 app.get("/debug", async () => ({ uptime: process.uptime(), events: debugRing }));
 
@@ -73,12 +86,51 @@ function isFromTwilio(req: { headers: Record<string, unknown>; body?: unknown; u
 
 // ---- Task API -------------------------------------------------------------
 
-app.post("/v1/tasks", async (req, reply) => {
-  const parsed = BriefSchema.safeParse(req.body);
-  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-  const task: Task = { taskId: `task_${randomUUID()}`, brief: parsed.data, status: "created", calls: [] };
+const DEMO_BRIEF = {
+  goal: "Find same-day iPhone 15 screen repair (demo task)",
+  location: "Lekki, Lagos",
+  maxPrice: 130000,
+  requiredAnswers: ["availability", "total price", "completion time", "warranty"]
+};
+
+function makeTask(brief: Brief): Task {
+  const task: Task = { taskId: `task_${randomUUID()}`, brief, status: "created", calls: [] };
   tasks.set(task.taskId, task);
-  return { taskId: task.taskId, status: task.status, normalizedBrief: task.brief };
+  return task;
+}
+
+app.post("/v1/tasks", async (req, reply) => {
+  // Paid x402 request or x-api-key both unlock task creation.
+  const payHeader = (req.headers["payment-signature"] ?? req.headers["x-payment"]) as string | undefined;
+  let payment: VerifiedPayment | null = null;
+  if (payHeader) {
+    const v = verifyPaymentHeader(payHeader);
+    if (typeof v === "string") {
+      dbg(`x402 payment rejected: ${v}`);
+      return reply.code(402).send({ error: `payment invalid: ${v}` });
+    }
+    payment = v;
+    dbg(`x402 payment accepted from ${payment.payer} (${payment.scheme})`);
+  }
+  const parsed = BriefSchema.safeParse(req.body);
+  if (!parsed.success) {
+    // Paid request with an empty/invalid brief still gets a deliverable: a
+    // demo task (task creation alone never places calls).
+    if (payment) {
+      const task = makeTask(BriefSchema.parse(DEMO_BRIEF));
+      reply.header("PAYMENT-RESPONSE", paymentReceipt(payment));
+      return {
+        taskId: task.taskId, status: task.status,
+        note: "brief missing/invalid — demo task created; normalizedBrief shows the expected shape",
+        normalizedBrief: task.brief,
+        resultUrl: `https://${process.env.PUBLIC_HOST}/t/${task.taskId}`
+      };
+    }
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const task = makeTask(parsed.data);
+  if (payment) reply.header("PAYMENT-RESPONSE", paymentReceipt(payment));
+  return { taskId: task.taskId, status: task.status, normalizedBrief: task.brief, resultUrl: `https://${process.env.PUBLIC_HOST}/t/${task.taskId}` };
 });
 
 app.post<{ Params: { id: string }; Body: { to: string } }>("/v1/tasks/:id/call", async (req, reply) => {
