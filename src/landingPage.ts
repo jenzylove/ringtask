@@ -21,13 +21,13 @@ a{color:var(--acc)}
 <div class="card">
 <form id="f">
 <label>What do you need?</label>
-<input name="goal" required placeholder="Find same-day iPhone 15 screen repair" value="Find same-day iPhone 15 screen repair">
+<input name="goal" required placeholder="e.g. Find same-day iPhone 15 screen repair">
 <label>Location</label>
-<input name="location" required placeholder="Lekki, Lagos" value="Lekki, Lagos">
+<input name="location" required placeholder="e.g. Lekki, Lagos">
 <label>Max budget (NGN, optional)</label>
-<input name="maxPrice" type="number" placeholder="130000" value="130000">
+<input name="maxPrice" type="number" placeholder="e.g. 130000">
 <label>Questions to answer (comma-separated)</label>
-<input name="requiredAnswers" required value="screen availability, total price, completion time, warranty">
+<input name="requiredAnswers" required placeholder="e.g. availability, total price, completion time, warranty">
 <label>Business phone numbers to call (E.164, comma-separated, max 3)</label>
 <input name="numbers" required placeholder="+2348012345678">
 <label>Access key</label>
