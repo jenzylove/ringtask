@@ -346,3 +346,14 @@ app.get("/media", { websocket: true }, (ws, req) => {
 
 const port = Number(process.env.PORT ?? 3001);
 await app.listen({ port, host: "0.0.0.0" });
+
+// Self-ping keepalive: Render's free tier sleeps after ~15 min with no
+// INBOUND request. An internal timer that hits our own PUBLIC_HOST/health
+// generates that inbound request, keeping the instance warm so a reviewer's
+// paid probe never lands on a cold start. Disable with KEEPALIVE=off.
+if (process.env.PUBLIC_HOST && process.env.KEEPALIVE !== "off") {
+  const url = `https://${process.env.PUBLIC_HOST}/health`;
+  setInterval(() => {
+    fetch(url).catch((e) => dbg(`self-ping failed: ${e.message}`));
+  }, Number(process.env.KEEPALIVE_MS ?? 600_000)).unref();
+}
