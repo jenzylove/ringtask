@@ -13,14 +13,35 @@
  * Then served with a PAYMENT-RESPONSE receipt header. `exact`
  * authorizations are redeemed on-chain by the payee out-of-band.
  */
-import { verifyTypedData } from "ethers";
+import { verifyTypedData, TypedDataEncoder } from "ethers";
 
 const NETWORK = "eip155:196"; // X Layer
 const CHAIN_ID = 196;
 const USDT_XLAYER = process.env.X402_ASSET ?? "0x779ded0c9e1022225f8e0630b35a9b54be713736";
-const ASSET_NAME = process.env.X402_ASSET_NAME ?? "USDT";
+// EIP-712 domain name is the token's ON-CHAIN name() — "USD₮0" (U+20AE),
+// NOT "USDT". A real x402 `exact` client derives its signing domain from
+// the token itself, so this must match byte-for-byte or ecrecover yields
+// the wrong address ("signature does not recover to payer").
+const ASSET_NAME = process.env.X402_ASSET_NAME ?? "USD₮0";
 const ASSET_VERSION = process.env.X402_ASSET_VERSION ?? "1";
 const PAY_TO = process.env.X402_PAY_TO ?? "";
+
+/** The token's real on-chain DOMAIN_SEPARATOR (queried from X Layer). */
+export const ONCHAIN_DOMAIN_SEPARATOR =
+  "0xd591d9baf744328d9400b923cb02c9474d367d591ca1ab24d8c4068be527599d";
+
+/** The EIP-712 domain we sign/verify under — must reproduce the token's separator. */
+export const PAYMENT_DOMAIN = {
+  name: ASSET_NAME,
+  version: ASSET_VERSION,
+  chainId: CHAIN_ID,
+  verifyingContract: USDT_XLAYER
+};
+
+/** True iff our domain reproduces the token's on-chain DOMAIN_SEPARATOR. */
+export function domainMatchesChain(): boolean {
+  return TypedDataEncoder.hashDomain(PAYMENT_DOMAIN).toLowerCase() === ONCHAIN_DOMAIN_SEPARATOR.toLowerCase();
+}
 
 export interface ServiceOffer {
   amountBaseUnits: string; // 6-decimals USDT
@@ -107,7 +128,7 @@ export function verifyPaymentHeader(headerValue: string, requiredAmount: string)
     // to the claimed payer, under the domain we declared in the challenge.
     try {
       const recovered = verifyTypedData(
-        { name: ASSET_NAME, version: ASSET_VERSION, chainId: CHAIN_ID, verifyingContract: USDT_XLAYER },
+        PAYMENT_DOMAIN,
         EIP3009_TYPES,
         { from: auth.from, to: auth.to, value: auth.value, validAfter: auth.validAfter ?? 0, validBefore: auth.validBefore ?? 0, nonce: auth.nonce ?? "0x" + "0".repeat(64) },
         sig

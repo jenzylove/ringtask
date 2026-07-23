@@ -5,7 +5,7 @@ import websocket from "@fastify/websocket";
 import formbody from "@fastify/formbody";
 import { randomUUID } from "node:crypto";
 import { BriefSchema, type Brief } from "./brief.js";
-import { paymentChallenge, verifyPaymentHeader, paymentReceipt, type VerifiedPayment, type ServiceOffer } from "./x402.js";
+import { paymentChallenge, verifyPaymentHeader, paymentReceipt, domainMatchesChain, type VerifiedPayment, type ServiceOffer } from "./x402.js";
 
 const BRIEF_BODY_SCHEMA = {
   type: "object",
@@ -343,6 +343,12 @@ app.get("/media", { websocket: true }, (ws, req) => {
   };
   ws.on("message", onFirst);
 });
+
+// Fail-loud guard: if our EIP-712 domain no longer reproduces the token's
+// on-chain DOMAIN_SEPARATOR, signed payments can never verify. Surface it.
+if (!domainMatchesChain()) {
+  dbg("FATAL: x402 EIP-712 domain does not match the token's on-chain DOMAIN_SEPARATOR — signed payments will be rejected");
+}
 
 const port = Number(process.env.PORT ?? 3001);
 await app.listen({ port, host: "0.0.0.0" });

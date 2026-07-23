@@ -14,7 +14,7 @@ const auth = {
   nonce: hexlify(randomBytes(32))
 };
 const signature = await wallet.signTypedData(
-  { name: process.env.X402_ASSET_NAME ?? "USDT", version: "1", chainId: 196, verifyingContract: "0x779ded0c9e1022225f8e0630b35a9b54be713736" },
+  { name: process.env.X402_ASSET_NAME ?? "USD₮0", version: "1", chainId: 196, verifyingContract: "0x779ded0c9e1022225f8e0630b35a9b54be713736" },
   { TransferWithAuthorization: [
     { name: "from", type: "address" }, { name: "to", type: "address" },
     { name: "value", type: "uint256" }, { name: "validAfter", type: "uint256" },
